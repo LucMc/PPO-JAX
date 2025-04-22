@@ -1,0 +1,22 @@
+[project]
+name = "ppo_jax"
+version = "0.1.0"
+description = "Continuous PPO Flax implementation"
+readme = "README.md"
+requires-python = ">=3.11, <3.13"
+dependencies = [
+    "distrax>=0.1.5",
+    "flax>=0.9.0",
+    "gymnasium[mujoco]>=1.0.0",
+    "gymnasium[box2d]",
+    "jax[cuda12]>=0.4.34",
+    "jaxtyping>=0.2.34",
+    "numpy>=2.1.2",
+    "orbax-checkpoint>=0.7.0",
+    "tyro>=0.8.11",
+    "wandb>=0.18.5",
+]
+
+[tool.ruff]
+ignore = ["F722"]
+ignore-init-module-imports = true
