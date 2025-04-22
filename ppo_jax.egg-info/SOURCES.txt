@@ -1,8 +1,0 @@
-README.md
-ppo.py
-pyproject.toml
-ppo_jax.egg-info/PKG-INFO
-ppo_jax.egg-info/SOURCES.txt
-ppo_jax.egg-info/dependency_links.txt
-ppo_jax.egg-info/requires.txt
-ppo_jax.egg-info/top_level.txt
