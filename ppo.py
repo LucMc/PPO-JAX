@@ -16,14 +16,6 @@ import tyro
 # import time
 # from memory_profiler import profile
 
-"""
-TODO:
- - Change from calculating mini-batches based on batch_size to using n_mini_batches a 
- param directly (less to change when chaning n_envs/ more intuitive)
- - What is causing KL divergence spikes?
- - Is the scanned gae giving different results? Seems adv std is higher? Could be training tho
-"""
-
 
 @dataclass(frozen=True)
 class Config:
@@ -44,7 +36,7 @@ class Config:
     learning_rate: float = 3e-4
     vf_coef: float = 0.5
     render: bool = False
-    log: bool = False # Log with wandb
+    log: bool = False  # Log with wandb
 
 
 class ActorNet(nn.Module):
@@ -67,7 +59,7 @@ class ActorNet(nn.Module):
         )
         logstd_batch = jnp.broadcast_to(
             log_std, mean.shape
-        )  # Make logstd the same shape as actions
+        )  # Makes logstd the same shape as actions
         return distrax.MultivariateNormalDiag(
             loc=mean, scale_diag=jnp.exp(logstd_batch)
         )
@@ -146,7 +138,7 @@ class PPO(Config):
 
         for i in range(
             n_minibatches
-        ):  # TODO: Does scan help since n_mini is low anyway?
+        ):  # TODO: would this being a scan help since n_mini is low anyway?
             # advantage normalisation
             adv_norm = (advantages[i] - advantages[i].mean()) / (
                 advantages[i].std() + 1e-8
@@ -328,7 +320,9 @@ def make_env(env_id: str, idx: int, gamma: float, env_args: dict = {}):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         # env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.NormalizeReward(env, gamma=0.99) # TODO: replace with actual gamma
+        env = gym.wrappers.NormalizeReward(
+            env, gamma=0.99
+        )  # TODO: replace with actual gamma
 
         if "render_mode" in env_args.keys():
             env = gym.wrappers.RecordVideo(
@@ -394,8 +388,8 @@ def main(config):
 
     if ppo_agent.log:
         wandb.init(
-            project="jax-ppo", # NOTE: <Change me>
-            name="ppo-0.1", # NOTE: <Change me>
+            project="jax-ppo",  # NOTE: <Change me>
+            name="ppo-0.1",  # NOTE: <Change me>
             config=config.__dict__,  # Get from tyro
             tags=["PPO", ppo_agent.env_id],
         )
@@ -470,4 +464,3 @@ def main(config):
 if __name__ == "__main__":
     config = tyro.cli(Config)
     main(config)
-
