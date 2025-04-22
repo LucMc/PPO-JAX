@@ -1,2 +1,4 @@
 .envrc
 *.egg-info
+.venv/
+.git/
