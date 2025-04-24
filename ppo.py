@@ -1,8 +1,9 @@
+from ast import Tuple
 from chex import dataclass
 import jax
 import jax.numpy as jnp
 import jax.random as random
-from jaxtyping import Array
+from jaxtyping import Array, Float, PRNGKeyArray
 import flax.linen as nn
 from flax.training.train_state import TrainState
 import gymnasium as gym
@@ -13,29 +14,41 @@ from pprint import pprint
 from functools import partial
 import wandb
 import tyro
+import os
+from pathlib import Path
+
 # import time
 # from memory_profiler import profile
+from jaxtyping import jaxtyped, TypeCheckError
+# from beartype import beartype as typechecker
+
+"""
+TODO:
+ - Change from calculating mini-batches based on batch_size to using n_mini_batches a 
+ param directly (less to change when chaning n_envs/ more intuitive)
+ - Test w/ multiple envs?
+"""
 
 
 @dataclass(frozen=True)
 class Config:
     """All the options for the experiment, all accessable within PPO class"""
 
-    training_steps: int = 500_000
-    n_envs: int = 1
-    rollout_steps: int = 64 * 5
-    env_id: str = "LunarLander-v3"
-    batch_size: int = 64
-    clip_range: float = 0.2
-    epochs: int = 10
-    max_grad_norm: float = 0.5
-    gamma: float = 0.99
-    vf_clip_range: float = np.inf
-    ent_coef: float = 0.0
-    gae_lambda: float = 0.95
-    learning_rate: float = 3e-4
-    vf_coef: float = 0.5
-    render: bool = False
+    training_steps: int = 500_000  # total training time-steps
+    n_envs: int = 1  # number of parralel training envs
+    rollout_steps: int = 64 * 20  # env steps per rollout
+    env_id: str = "LunarLanderContinuous-v3"
+    batch_size: int = 64  # minibatch size
+    clip_range: float = 0.2  # policy clip range
+    epochs: int = 10  # number of epochs for fitting mini-batches
+    max_grad_norm: float = 0.5  # maximum gradient norm
+    gamma: float = 0.99  # discount factor
+    vf_clip_range: float = np.inf  # vf clipping (typically higher than clip_range)
+    ent_coef: float = 0.0  # how much exploration?
+    gae_lambda: float = 0.95  # bias-variance tradeoff in gae
+    learning_rate: float = 3e-4  # lr for both actor and critic
+    vf_coef: float = 0.5  # balance vf loss magnitude
+    log_video: bool = False  # save videos locally/on wandb
     log: bool = False  # Log with wandb
 
 
@@ -59,7 +72,7 @@ class ActorNet(nn.Module):
         )
         logstd_batch = jnp.broadcast_to(
             log_std, mean.shape
-        )  # Makes logstd the same shape as actions
+        )  # Make logstd the same shape as actions
         return distrax.MultivariateNormalDiag(
             loc=mean, scale_diag=jnp.exp(logstd_batch)
         )
@@ -67,7 +80,7 @@ class ActorNet(nn.Module):
 
 class ValueNet(nn.Module):
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x) -> Array:
         x = nn.Dense(128)(x)
         x = nn.relu(x)
         x = nn.Dense(64)(x)
@@ -80,17 +93,18 @@ class ValueNet(nn.Module):
 class PPO(Config):
     buffer_size: int = 2048
 
+    # @jaxtyped(typechecker=typechecker)
     @partial(jax.jit, static_argnames=["self"])
     def update(
         self,
-        actor_ts,
-        value_ts,
-        obss,
-        actions,
-        old_values,
-        old_log_probs,
-        advantages,
-        returns,
+        actor_ts: TrainState,
+        value_ts: TrainState,
+        obss: Float[Array, "#n_minibatches #batch_size #obs_dim"],
+        actions: Float[Array, "#n_minibatches #batch_size #action_dim"],
+        old_values: Float[Array, "#n_minibatches #batch_size 1"],
+        old_log_probs: Float[Array, "#n_minibatches #batch_size"],
+        advantages: Float[Array, "#n_minibatches #batch_size"],
+        returns: Float[Array, "#n_minibatches #batch_size"],
     ):
         def actor_loss(
             actor_params, obs_batch, action_batch, old_log_prob_batch, adv_batch
@@ -138,7 +152,7 @@ class PPO(Config):
 
         for i in range(
             n_minibatches
-        ):  # TODO: would this being a scan help since n_mini is low anyway?
+        ):  # TODO: Does scan help since n_mini is low anyway?
             # advantage normalisation
             adv_norm = (advantages[i] - advantages[i].mean()) / (
                 advantages[i].std() + 1e-8
@@ -191,14 +205,15 @@ class PPO(Config):
             },
         )
 
+    # @jaxtyped(typechecker=typechecker)
     def get_rollout(
         self,
-        actor_ts,
-        value_ts,
-        envs,
-        last_obs,
-        last_episode_start,
-        key,
+        actor_ts: TrainState,
+        value_ts: TrainState,
+        envs: gym.vector.VectorEnv,
+        last_obs: np.ndarray,  # Array["#n_envs"]
+        last_episode_start: np.ndarray,  # Array["#n_envs"]
+        key: PRNGKeyArray,
     ):
         n_envs = envs.num_envs
         episode_starts = np.zeros((self.rollout_steps, n_envs))
@@ -220,6 +235,7 @@ class PPO(Config):
 
             _obs, reward, terminated, truncated, info = envs.step(np.array(action))
 
+            # TODO: Check shapes are correct for multiple envs
             rewards[i] = reward
             actions[i] = action
             episode_starts[i] = last_episode_start
@@ -275,13 +291,14 @@ class PPO(Config):
             "value lr": value_ts.opt_state[-1].hyperparams["learning_rate"],
         }
 
+    # @jaxtyped(typechecker=typechecker)
     @partial(jax.jit, static_argnames="self")
     def compute_returns_and_advantage(
         self,
-        rewards: Array,
-        values: Array,
-        episode_starts: Array,
-        last_value: Array,
+        rewards: Float[Array, "#rollout_steps"],
+        values: Float[Array, "#rollout_steps"],
+        episode_starts: Float[Array, "#rollout_steps"],
+        last_value: Float[Array, "1"],
         done: Array,
     ) -> tuple[Array, Array]:
         buffer_size = values.shape[0]
@@ -313,20 +330,18 @@ class PPO(Config):
         return returns, advantages
 
 
-def make_env(env_id: str, idx: int, gamma: float, env_args: dict = {}):
+def make_env(ppo_agent: PPO, idx: int, video_folder: str = None, env_args: dict = {}):
     def thunk():
-        env = gym.make(env_id, **env_args)
+        env = gym.make(ppo_agent.env_id, **env_args)
         # env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         # env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.NormalizeReward(
-            env, gamma=0.99
-        )  # TODO: replace with actual gamma
-
-        if "render_mode" in env_args.keys():
+        # env = gym.wrappers.NormalizeObservation(env)
+        # env = gym.wrappers.NormalizeReward(env, gamma=0.99) # TODO: replace with actual gamma
+        if ppo_agent.log_video and idx == 0:
+            print(":: Recording Videos ::")
             env = gym.wrappers.RecordVideo(
-                env, episode_trigger=lambda t: t % 200 == 0, video_folder="./videos/"
+                env, episode_trigger=lambda t: t % 20 == 0, video_folder=video_folder
             )
         return env
 
@@ -341,8 +356,13 @@ def make_env(env_id: str, idx: int, gamma: float, env_args: dict = {}):
 
 # @profile
 @partial(jax.jit, static_argnames=["ppo_agent"])
-def outer_loop(key, actor_ts, value_ts, rollout, ppo_agent):
-    # This stuff doesn't need to be defined every epoch, maybe bring out and parse into this or attach to ppo_agent
+def outer_loop(
+    key: PRNGKeyArray,
+    actor_ts: TrainState,
+    value_ts: TrainState,
+    rollout: Tuple,
+    ppo_agent: PPO,
+):
     n_minibatches = ppo_agent.buffer_size // ppo_agent.batch_size
     swap_and_reshape = lambda x: jnp.swapaxes(x, 0, 1).reshape(
         (ppo_agent.buffer_size,) + x.shape[2:]
@@ -378,20 +398,28 @@ def outer_loop(key, actor_ts, value_ts, rollout, ppo_agent):
     return actor_ts, value_ts, key, info
 
 
-def main(config):
-    # TODO: Wandb watch models and log videos
+def main(config: Config):
     ppo_agent = PPO(buffer_size=config.n_envs * config.rollout_steps, **config.__dict__)
 
-    env_args = {"continuous": True}
-    if ppo_agent.render:
-        env_args.update({"render_mode": "rgb_array"})
+    if ppo_agent.log_video:
+        base_video_dir = Path("videos")
+        video_folder = base_video_dir / str(
+            len(os.listdir(base_video_dir))
+        )  # run_id for local videos
+        os.makedirs(video_folder)
+        env_args = {"render_mode": "rgb_array"}
+    else:
+        video_folder = None
+        env_args = {}
 
     if ppo_agent.log:
         wandb.init(
-            project="jax-ppo",  # NOTE: <Change me>
-            name="ppo-0.1",  # NOTE: <Change me>
-            config=config.__dict__,  # Get from tyro
+            project="jax-ppo",
+            name="ppo-0.1",
+            config=config.__dict__,  # Get from tyro etc
             tags=["PPO", ppo_agent.env_id],
+            # monitor_gym=True,
+            save_code=True,
         )
 
     ckpt_path = "./checkpoints"
@@ -401,7 +429,7 @@ def main(config):
 
     envs = gym.vector.SyncVectorEnv(
         [
-            make_env(ppo_agent.env_id, i, ppo_agent.gamma, env_args=env_args)
+            make_env(ppo_agent, i, video_folder=video_folder, env_args=env_args)
             for i in range(ppo_agent.n_envs)
         ]
     )
@@ -457,10 +485,23 @@ def main(config):
         if ppo_agent.log:
             wandb.log(full_logs, step=current_global_step)
 
-        if current_global_step % 100_000 == 0:
-            wandb.save(ckpt_path)
+            if current_global_step % 100_000 == 0:
+                wandb.save(ckpt_path)
+
+    # Close stuff
+    if ppo_agent.log:
+        if ppo_agent.log_video:
+            print("[ ] Uploading Videos ...", end="\r")
+            for video_name in os.listdir(video_folder):
+                wandb.log({video_name: wandb.Video(str(base_video_dir / video_name))})
+            print(r"[x] Uploading Videos ...")
+
+        wandb.finish()
+    envs.close()
 
 
 if __name__ == "__main__":
     config = tyro.cli(Config)
     main(config)
+
+# _reward = np.where(truncated, self.gamma * value_ts.apply_fn(value_ts.params, jnp.array(_obs)).item(), reward) # should be added to r anyway
