@@ -17,18 +17,6 @@ import tyro
 import os
 from pathlib import Path
 
-# import time
-# from memory_profiler import profile
-from jaxtyping import jaxtyped, TypeCheckError
-# from beartype import beartype as typechecker
-
-"""
-TODO:
- - Change from calculating mini-batches based on batch_size to using n_mini_batches a 
- param directly (less to change when chaning n_envs/ more intuitive)
- - Test w/ multiple envs?
-"""
-
 
 @dataclass(frozen=True)
 class Config:
@@ -48,8 +36,8 @@ class Config:
     gae_lambda: float = 0.95  # bias-variance tradeoff in gae
     learning_rate: float = 3e-4  # lr for both actor and critic
     vf_coef: float = 0.5  # balance vf loss magnitude
-    log_video: bool = False  # save videos locally/on wandb
-    log: bool = False  # Log with wandb
+    log_video_every: int = 0  # save video locally/wandb every X time-steps
+    log: bool = False  # log with wandb
 
 
 class ActorNet(nn.Module):
@@ -150,9 +138,7 @@ class PPO(Config):
         kl_total = 0
         clip_fraction_total = 0
 
-        for i in range(
-            n_minibatches
-        ):  # TODO: Does scan help since n_mini is low anyway?
+        for i in range(n_minibatches):
             # advantage normalisation
             adv_norm = (advantages[i] - advantages[i].mean()) / (
                 advantages[i].std() + 1e-8
@@ -200,7 +186,7 @@ class PPO(Config):
                 ),
                 "actor_g_mag": jax.tree.reduce(
                     lambda acc, g: acc + jnp.sum(jnp.abs(g)),
-                    actor_grads,  # , initializer=0
+                    actor_grads,
                 ),
             },
         )
@@ -215,17 +201,18 @@ class PPO(Config):
         last_episode_start: np.ndarray,  # Array["#n_envs"]
         key: PRNGKeyArray,
     ):
-        n_envs = envs.num_envs
-        episode_starts = np.zeros((self.rollout_steps, n_envs))
-        truncated = np.zeros((self.rollout_steps, n_envs))
-        # values = np.zeros((self.rollout_steps, n_envs))
-        rewards = np.zeros((self.rollout_steps, n_envs))
-        log_probs = np.zeros((self.rollout_steps, n_envs))
-        stds = np.zeros((self.rollout_steps,) + envs.action_space.shape)
-        obss = np.zeros((self.rollout_steps,) + envs.observation_space.shape)
-        actions = np.zeros((self.rollout_steps,) + envs.action_space.shape)
+        rollout_size = self.rollout_steps // self.n_envs
 
-        for i in range(self.rollout_steps):
+        episode_starts = np.zeros((rollout_size, self.n_envs))
+        rewards = np.zeros((rollout_size, self.n_envs))
+        log_probs = np.zeros((rollout_size, self.n_envs))
+
+        stds = np.zeros((rollout_size,) + envs.action_space.shape)
+        obss = np.zeros((rollout_size,) + envs.observation_space.shape)
+        actions = np.zeros((rollout_size,) + envs.action_space.shape)
+        infos = []
+
+        for i in range(self.rollout_steps // self.n_envs):
             action_key, key = random.split(key)
             action_dist = actor_ts.apply_fn(actor_ts.params, jnp.array(last_obs))
             action = action_dist.sample(seed=action_key)
@@ -235,61 +222,52 @@ class PPO(Config):
 
             _obs, reward, terminated, truncated, info = envs.step(np.array(action))
 
-            # TODO: Check shapes are correct for multiple envs
             rewards[i] = reward
             actions[i] = action
             episode_starts[i] = last_episode_start
             log_probs[i] = log_prob
             obss[i] = last_obs
             stds[i] = action_dist.stddev()
+            infos.append(info)
 
-            episode_start = False
             last_obs = _obs
             last_episode_start = terminated
 
         values = value_ts.apply_fn(value_ts.params, jnp.array(obss))
-        # Fix truncated using value
         last_values = value_ts.apply_fn(value_ts.params, jnp.array(last_obs))
-
-        times_diff = []
 
         returns, advantages = jax.vmap(
             self.compute_returns_and_advantage, in_axes=(1, 1, 1, 0, 0)
         )(
             rewards,
-            values.squeeze(axis=-1),
+            values.squeeze(axis=-1),  # remove squeeze
             episode_starts,
             last_values,
             last_episode_start,
         )
 
-        # Metrics
-        ret_var = np.var(returns.flatten())
-
-        explained_var = (
-            np.nan
-            if ret_var == 0
-            else float(1 - np.var(returns.flatten() - values.flatten()) / ret_var)
-        )
-
-        return (
-            jnp.array(obss),
-            jnp.array(actions),
-            values,
-            log_probs,
-            advantages,
-            returns,
-        ), {
-            "mean rollout reward": np.mean(
-                rewards
-            ),  # TODO: should negate the last episode
+        rollout_info = {
+            "mean rollout reward": np.mean(rewards),
             "advantage_mean": jnp.mean(advantages),
             "advantage_std": jnp.std(advantages),
-            "explained variance": explained_var,
+            "explained variance": float(1 - (np.var(advantages.flatten()) / np.var(returns.flatten()))),
             "actor lr": actor_ts.opt_state[-1].hyperparams["learning_rate"],
             "action_dist_std": stds.mean(),
             "value lr": value_ts.opt_state[-1].hyperparams["learning_rate"],
         }
+
+        return (
+            (
+                jnp.array(obss),
+                jnp.array(actions),
+                values,
+                log_probs,
+                advantages,
+                returns,
+            ),
+            rollout_info,
+            infos,
+        )
 
     # @jaxtyped(typechecker=typechecker)
     @partial(jax.jit, static_argnames="self")
@@ -329,179 +307,188 @@ class PPO(Config):
         returns = advantages + values
         return returns, advantages
 
+    def make_env(self, idx: int, video_folder: str = None, env_args: dict = {}):
+        def thunk():
+            env = gym.make(self.env_id, **env_args)
+            # env = gym.wrappers.FlattenObservation(env)
+            env = gym.wrappers.RecordEpisodeStatistics(env)
+            # env = gym.wrappers.ClipAction(env)
+            # env = gym.wrappers.NormalizeObservation(env)
+            # env = gym.wrappers.NormalizeReward(env, gamma=self.gamma) # TODO: replace with actual gamma
+            if self.log_video_every and idx == 0:
+                print(":: Recording Videos ::")
+                env = gym.wrappers.RecordVideo(
+                    env,
+                    episode_trigger=lambda t: t % 20 == 0,
+                    video_folder=video_folder,
+                )
+            return env
 
-def make_env(ppo_agent: PPO, idx: int, video_folder: str = None, env_args: dict = {}):
-    def thunk():
-        env = gym.make(ppo_agent.env_id, **env_args)
-        # env = gym.wrappers.FlattenObservation(env)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        # env = gym.wrappers.ClipAction(env)
-        # env = gym.wrappers.NormalizeObservation(env)
-        # env = gym.wrappers.NormalizeReward(env, gamma=0.99) # TODO: replace with actual gamma
-        if ppo_agent.log_video and idx == 0:
-            print(":: Recording Videos ::")
-            env = gym.wrappers.RecordVideo(
-                env, episode_trigger=lambda t: t % 20 == 0, video_folder=video_folder
+        return thunk
+
+    # @partial(jax.jit, static_argnames=["self"])
+    def outer_loop(
+        self,
+        key: PRNGKeyArray,
+        actor_ts: TrainState,
+        value_ts: TrainState,
+        rollout: Tuple,
+    ):
+        n_minibatches = self.buffer_size // self.batch_size
+        swap_and_reshape = lambda x: jnp.swapaxes(x, 1, 1).reshape(
+            (self.buffer_size,) + x.shape[2:]
+        )
+
+        shape_minibatches = lambda x, idxs: x[idxs].reshape(
+            (n_minibatches, self.batch_size) + x.shape[1:]
+        )
+
+        flat_rollout = tuple(map(swap_and_reshape, rollout))
+
+        def inner_loop(carry, _):
+            actor_ts, value_ts, key = carry
+            key, perm_key = random.split(key)
+            idxs = random.permutation(perm_key, self.buffer_size)
+            mb_rollout = tuple(shape_minibatches(x, idxs) for x in flat_rollout)
+
+            actor_ts, value_ts, info = PPO.update(
+                self,
+                actor_ts,
+                value_ts,
+                *mb_rollout,
             )
-        return env
+            return (actor_ts, value_ts, key), info
 
-    return thunk
-
-
-# Alternative minibatch gen for mem-constrained devices
-# def get_minibatch(data, idxs):
-#     for i in range(n_minibatches):
-#         yield data[idxs][i*ppo_agent.batch_size:(i+1)*ppo_agent.batch_size]
-
-
-# @profile
-@partial(jax.jit, static_argnames=["ppo_agent"])
-def outer_loop(
-    key: PRNGKeyArray,
-    actor_ts: TrainState,
-    value_ts: TrainState,
-    rollout: Tuple,
-    ppo_agent: PPO,
-):
-    n_minibatches = ppo_agent.buffer_size // ppo_agent.batch_size
-    swap_and_reshape = lambda x: jnp.swapaxes(x, 0, 1).reshape(
-        (ppo_agent.buffer_size,) + x.shape[2:]
-    )
-
-    shape_minibatches = lambda x, idxs: x[idxs].reshape(
-        (n_minibatches, ppo_agent.batch_size) + x.shape[1:]
-    )
-
-    actor_ts_pams = actor_ts.params
-    flat_rollout = tuple(map(swap_and_reshape, rollout))
-
-    def inner_loop(carry, _):
-        actor_ts, value_ts, key = carry
-        key, perm_key = random.split(key)
-        idxs = random.permutation(perm_key, ppo_agent.buffer_size)
-        mb_rollout = tuple(shape_minibatches(x, idxs) for x in flat_rollout)
-
-        actor_ts, value_ts, info = PPO.update(
-            ppo_agent,
-            actor_ts,
-            value_ts,
-            *mb_rollout,
-        )
-        return (actor_ts, value_ts, key), info
-
-    (actor_ts, value_ts, key), info = jax.lax.scan(
-        inner_loop, (actor_ts, value_ts, key), jnp.arange(ppo_agent.epochs)
-    )
-
-    # remove to see over epochs, or change to min/max if curious
-    info = jax.tree.map(lambda x: x.mean(), info)
-    return actor_ts, value_ts, key, info
-
-
-def main(config: Config):
-    ppo_agent = PPO(buffer_size=config.n_envs * config.rollout_steps, **config.__dict__)
-
-    if ppo_agent.log_video:
-        base_video_dir = Path("videos")
-        video_folder = base_video_dir / str(
-            len(os.listdir(base_video_dir))
-        )  # run_id for local videos
-        os.makedirs(video_folder)
-        env_args = {"render_mode": "rgb_array"}
-    else:
-        video_folder = None
-        env_args = {}
-
-    if ppo_agent.log:
-        wandb.init(
-            project="jax-ppo",
-            name="ppo-0.1",
-            config=config.__dict__,  # Get from tyro etc
-            tags=["PPO", ppo_agent.env_id],
-            # monitor_gym=True,
-            save_code=True,
+        (_actor_ts, _value_ts, key), info = jax.lax.scan(
+            inner_loop, (actor_ts, value_ts, key), jnp.arange(self.epochs)
         )
 
-    ckpt_path = "./checkpoints"
-    assert not ppo_agent.rollout_steps % ppo_agent.batch_size, (  # TODO: Make adaptive
-        "Must have rollout steps divisible into batches"
-    )
+        # Add other metrics here if needed
+        info = jax.tree.map(lambda x: x.mean(), info)
+        return _actor_ts, _value_ts, key, info
 
-    envs = gym.vector.SyncVectorEnv(
-        [
-            make_env(ppo_agent, i, video_folder=video_folder, env_args=env_args)
-            for i in range(ppo_agent.n_envs)
-        ]
-    )
-
-    dummy_obs, _ = envs.reset()
-    key = random.PRNGKey(0)
-    current_global_step = 0
-
-    actor_key, value_key, key = random.split(key, num=3)
-
-    actor_net = ActorNet(envs.action_space.shape[-1])
-    value_net = ValueNet()
-    opt = optax.chain(
-        optax.clip_by_global_norm(ppo_agent.max_grad_norm),
-        optax.inject_hyperparams(optax.adamw)(
-            learning_rate=optax.linear_schedule(
-                init_value=ppo_agent.learning_rate,
-                end_value=ppo_agent.learning_rate / 10,
-                transition_steps=ppo_agent.training_steps,
-            ),
-        ),
-    )
-
-    actor_ts = TrainState.create(
-        apply_fn=actor_net.apply, params=actor_net.init(actor_key, dummy_obs), tx=opt
-    )
-    value_ts = TrainState.create(
-        apply_fn=value_net.apply, params=value_net.init(value_key, dummy_obs), tx=opt
-    )
-
-    last_obs, first_info = envs.reset()
-    last_episode_starts = np.ones((ppo_agent.n_envs,), dtype=bool)
-
-    while current_global_step < ppo_agent.training_steps:
-        print("\ncurrent_global_step:", current_global_step)
-        rollout, rollout_info = ppo_agent.get_rollout(
-            actor_ts,
-            value_ts,
-            envs,
-            last_obs,
-            last_episode_starts,
-            key,
+    @staticmethod
+    def main(config: Config):
+        ppo_agent = PPO(
+            buffer_size=config.n_envs * config.rollout_steps, **config.__dict__
         )
 
-        current_global_step += ppo_agent.rollout_steps * ppo_agent.n_envs
-
-        actor_ts, value_ts, key, training_info = outer_loop(
-            key, actor_ts, value_ts, rollout, ppo_agent
-        )
-        full_logs = training_info | rollout_info
-        pprint(full_logs)
+        if ppo_agent.log_video_every:
+            base_video_dir = Path("videos")
+            video_folder = base_video_dir / str(
+                len(os.listdir(base_video_dir))
+            )  # run_id for local videos
+            os.makedirs(video_folder)
+            env_args = {"render_mode": "rgb_array"}
+        else:
+            video_folder = None
+            env_args = {}
 
         if ppo_agent.log:
-            wandb.log(full_logs, step=current_global_step)
+            wandb.init(
+                project="jax-ppo",
+                name="ppo",
+                config=config.__dict__,  # Get from tyro etc
+                tags=["PPO", ppo_agent.env_id],
+                # monitor_gym=True,
+                save_code=True,
+            )
 
-            if current_global_step % 100_000 == 0:
-                wandb.save(ckpt_path)
+        ckpt_path = "./checkpoints"
+        assert (
+            not ppo_agent.rollout_steps % ppo_agent.batch_size
+        ), (  # TODO: Make adaptive
+            "Must have rollout steps divisible into batches"
+        )
 
-    # Close stuff
-    if ppo_agent.log:
-        if ppo_agent.log_video:
-            print("[ ] Uploading Videos ...", end="\r")
-            for video_name in os.listdir(video_folder):
-                wandb.log({video_name: wandb.Video(str(base_video_dir / video_name))})
-            print(r"[x] Uploading Videos ...")
+        envs = gym.vector.SyncVectorEnv(
+            [
+                ppo_agent.make_env(i, video_folder=video_folder, env_args=env_args)
+                for i in range(ppo_agent.n_envs)
+            ]
+        )
 
-        wandb.finish()
-    envs.close()
+        dummy_obs, _ = envs.reset()
+        key = random.PRNGKey(0)
+        current_global_step = 0
+
+        actor_key, value_key, key = random.split(key, num=3)
+
+        actor_net = ActorNet(envs.single_action_space.shape[0])
+        value_net = ValueNet()
+        opt = optax.chain(
+            optax.clip_by_global_norm(ppo_agent.max_grad_norm),
+            optax.inject_hyperparams(optax.adamw)(
+                learning_rate=optax.linear_schedule(
+                    init_value=ppo_agent.learning_rate,
+                    end_value=ppo_agent.learning_rate / 10,
+                    transition_steps=ppo_agent.training_steps,
+                ),
+            ),
+        )
+
+        actor_ts = TrainState.create(
+            apply_fn=actor_net.apply,
+            params=actor_net.init(actor_key, dummy_obs),
+            tx=opt,
+        )
+        value_ts = TrainState.create(
+            apply_fn=value_net.apply,
+            params=value_net.init(value_key, dummy_obs),
+            tx=opt,
+        )
+
+        last_obs, first_info = envs.reset()
+        last_episode_starts = np.ones((ppo_agent.n_envs,), dtype=bool)
+
+        while current_global_step < ppo_agent.training_steps:
+            print("\ncurrent_global_step:", current_global_step)
+            rollout, rollout_info, env_infos = ppo_agent.get_rollout(
+                actor_ts,
+                value_ts,
+                envs,
+                last_obs,
+                last_episode_starts,
+                key,
+            )
+
+            current_global_step += ppo_agent.rollout_steps * ppo_agent.n_envs
+
+            actor_ts, value_ts, key, training_info = ppo_agent.outer_loop(
+                key, actor_ts, value_ts, rollout
+            )
+
+            env_infos = {}  # Change this if there is anything in your env info you want to plot, i.e {"episode_length": env_infos["episode_length"]}
+
+            full_logs = training_info | rollout_info | env_infos
+            pprint(full_logs)
+
+            if ppo_agent.log:
+                wandb.log(full_logs, step=current_global_step)
+
+                if current_global_step % 100_000 == 0:
+                    wandb.save(ckpt_path)
+
+        # Close stuff
+        if ppo_agent.log:
+            if abs(ppo_agent.log_video_every - ppo_agent.rollout_steps) < ppo_agent:
+                print("[ ] Uploading Videos ...", end="\r")
+                for video_name in os.listdir(video_folder):
+                    wandb.log(
+                        {video_name: wandb.Video(str(base_video_dir / video_name))}
+                    )
+                print(r"[x] Uploading Videos ...")
+
+            wandb.finish()
+        envs.close()
 
 
 if __name__ == "__main__":
     config = tyro.cli(Config)
-    main(config)
+    PPO.main(config)
 
-# _reward = np.where(truncated, self.gamma * value_ts.apply_fn(value_ts.params, jnp.array(_obs)).item(), reward) # should be added to r anyway
+# Alternative minibatch gen for mem-constrained devices
+# def get_minibatch(data, idxs):
+#     for i in range(n_minibatches):
+#         yield data[idxs][i*ppo_agent.batch_size:(i+2)*ppo_agent.batch_size]
+
