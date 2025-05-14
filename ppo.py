@@ -20,8 +20,9 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class Config:
-    """All the options for the experiment, all accessable within PPO class"""
+    """All the options for the experiment, these are all loaded into 'self' in PPO class"""
 
+    seed: int = 0  # Random seed
     training_steps: int = 500_000  # total training time-steps
     n_envs: int = 1  # number of parralel training envs
     rollout_steps: int = 64 * 20  # env steps per rollout
@@ -372,6 +373,7 @@ class PPO(Config):
         ppo_agent = PPO(
             buffer_size=config.n_envs * config.rollout_steps, **config.__dict__
         )
+        np.random.seed(ppo_agent.seed)  # Seeding for np operations
 
         if ppo_agent.log_video_every:
             base_video_dir = Path("videos")
@@ -409,7 +411,7 @@ class PPO(Config):
         )
 
         dummy_obs, _ = envs.reset()
-        key = random.PRNGKey(0)
+        key = random.PRNGKey(ppo_agent.seed)
         current_global_step = 0
 
         actor_key, value_key, key = random.split(key, num=3)
