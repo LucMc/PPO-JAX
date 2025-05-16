@@ -80,9 +80,8 @@ class ValueNet(nn.Module):
 
 @dataclass(frozen=True)
 class PPO(Config):
-    buffer_size: int = 2048
+    buffer_size: int
 
-    # @jaxtyped(typechecker=typechecker)
     @partial(jax.jit, static_argnames=["self"])
     def update(
         self,
@@ -192,7 +191,6 @@ class PPO(Config):
             },
         )
 
-    # @jaxtyped(typechecker=typechecker)
     def get_rollout(
         self,
         actor_ts: TrainState,
@@ -270,7 +268,6 @@ class PPO(Config):
             infos,
         )
 
-    # @jaxtyped(typechecker=typechecker)
     @partial(jax.jit, static_argnames="self")
     def compute_returns_and_advantage(
         self,
