@@ -371,7 +371,7 @@ class PPO(Config):
     @staticmethod
     def main(config: Config):
         ppo_agent = PPO(
-            buffer_size=config.n_envs * config.rollout_steps, **config.__dict__
+            buffer_size=config.rollout_steps, **config.__dict__
         )
         np.random.seed(ppo_agent.seed)  # Seeding for np operations
 
