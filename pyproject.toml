@@ -15,8 +15,12 @@ dependencies = [
     "orbax-checkpoint>=0.7.0",
     "tyro>=0.8.11",
     "wandb>=0.18.5",
+    "brax"
 ]
 
 [tool.ruff]
 ignore = ["F722"]
 ignore-init-module-imports = true
+
+[tool.setuptools.packages.find]
+include = [".*"]

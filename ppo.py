@@ -62,9 +62,14 @@ class ActorNet(nn.Module):
         logstd_batch = jnp.broadcast_to(
             log_std, mean.shape
         )  # Make logstd the same shape as actions
-        return distrax.MultivariateNormalDiag(
-            loc=mean, scale_diag=jnp.exp(logstd_batch)
-        )
+        return mean, jnp.exp(logstd_batch)
+
+    def get_dist(self, params, x):
+        mean, scale = jax.jit(self.apply)(params, x)
+        return  distrax.MultivariateNormalDiag(
+                loc=mean, scale_diag=scale
+            )
+
 
 
 class ValueNet(nn.Module):
@@ -80,7 +85,7 @@ class ValueNet(nn.Module):
 
 @dataclass(frozen=True)
 class PPO(Config):
-    buffer_size: int
+    buffer_size: int = 1024
 
     @partial(jax.jit, static_argnames=["self"])
     def update(
@@ -427,12 +432,12 @@ class PPO(Config):
         )
 
         actor_ts = TrainState.create(
-            apply_fn=actor_net.apply,
+            apply_fn=actor_net.get_dist, # This jits the apply but not the dist itself
             params=actor_net.init(actor_key, dummy_obs),
             tx=opt,
         )
         value_ts = TrainState.create(
-            apply_fn=value_net.apply,
+            apply_fn=jax.jit(value_net.apply),
             params=value_net.init(value_key, dummy_obs),
             tx=opt,
         )
