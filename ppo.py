@@ -66,9 +66,7 @@ class ActorNet(nn.Module):
 
     def get_dist(self, params, x):
         mean, scale = jax.jit(self.apply)(params, x)
-        return  distrax.MultivariateNormalDiag(
-                loc=mean, scale_diag=scale
-            )
+        return  distrax.MultivariateNormalDiag(loc=mean, scale_diag=scale)
 
 
 
@@ -102,9 +100,10 @@ class PPO(Config):
         def actor_loss(
             actor_params, obs_batch, action_batch, old_log_prob_batch, adv_batch
         ):
-            dist = actor_ts.apply_fn(actor_params, obs_batch)
-            log_prob = dist.log_prob(action_batch)
-            entropy = dist.entropy()
+            mean, scale = actor_ts.apply_fn(actor_params, obs_batch)
+            action_dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=scale)
+            log_prob = action_dist.log_prob(action_batch)
+            entropy = action_dist.entropy()
             ratio = jnp.exp(log_prob - old_log_prob_batch)
 
             approx_kl = (
@@ -218,7 +217,10 @@ class PPO(Config):
 
         for i in range(self.rollout_steps // self.n_envs):
             action_key, key = random.split(key)
-            action_dist = actor_ts.apply_fn(actor_ts.params, jnp.array(last_obs))
+
+            mean, scale = actor_ts.apply_fn(actor_ts.params, jnp.array(last_obs))
+            action_dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=scale)
+
             action = action_dist.sample(seed=action_key)
             log_prob = action_dist.log_prob(action)
 
@@ -329,7 +331,7 @@ class PPO(Config):
 
         return thunk
 
-    # @partial(jax.jit, static_argnames=["self"])
+    @partial(jax.jit, static_argnames=["self"])
     def outer_loop(
         self,
         key: PRNGKeyArray,
@@ -432,7 +434,7 @@ class PPO(Config):
         )
 
         actor_ts = TrainState.create(
-            apply_fn=actor_net.get_dist, # This jits the apply but not the dist itself
+            apply_fn=jax.jit(actor_net.apply), # This jits the apply but not the dist itself
             params=actor_net.init(actor_key, dummy_obs),
             tx=opt,
         )
