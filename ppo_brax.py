@@ -46,11 +46,12 @@ class BraxPPO(PPO, BraxConfig):
             states, key = carry
 
             action_key, key = random.split(key)
-            action_dist = actor_ts.apply_fn(actor_ts.params, jnp.array(states.obs))
+            mean, scale = actor_ts.apply_fn(actor_ts.params, states.obs)
+            action_dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=scale)
             actions = action_dist.sample(seed=action_key)
             log_prob = action_dist.log_prob(actions)
 
-            value = value_ts.apply_fn(value_ts.params, jnp.array(states.obs))
+            value = value_ts.apply_fn(value_ts.params, states.obs)
             next_states = env.step(states, actions)
 
             return (next_states, key), (
